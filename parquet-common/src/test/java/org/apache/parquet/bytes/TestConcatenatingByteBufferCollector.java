@@ -1,0 +1,180 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.parquet.bytes;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Test class of {@link ConcatenatingByteBufferCollector}.
+ */
+public class TestConcatenatingByteBufferCollector {
+
+  private TrackingByteBufferAllocator allocator;
+
+  @BeforeEach
+  public void initAllocator() {
+    allocator = TrackingByteBufferAllocator.wrap(new HeapByteBufferAllocator());
+  }
+
+  @AfterEach
+  public void closeAllocator() {
+    allocator.close();
+  }
+
+  @Test
+  public void test() throws IOException {
+    byte[] result;
+    try (ConcatenatingByteBufferCollector outer = new ConcatenatingByteBufferCollector(allocator);
+        ConcatenatingByteBufferCollector inner = new ConcatenatingByteBufferCollector(allocator)) {
+      outer.collect(BytesInput.concat(
+          BytesInput.from(byteBuffer("This"), byteBuffer(" "), byteBuffer("is")),
+          BytesInput.from(List.of(byteBuffer(" a"), byteBuffer(" "), byteBuffer("test"))),
+          BytesInput.from(inputStream(" text to blabla"), 8),
+          BytesInput.from(bytes(" ")),
+          BytesInput.from(bytes("blabla validate blabla"), 7, 9),
+          BytesInput.from(byteArrayOutputStream("the class ")),
+          BytesInput.from(capacityByteArrayOutputStream("ConcatenatingByteBufferCollector"))));
+      inner.collect(BytesInput.fromInt(12345));
+      inner.collect(BytesInput.fromUnsignedVarInt(67891));
+      inner.collect(BytesInput.fromUnsignedVarLong(2345678901L));
+      inner.collect(BytesInput.fromZigZagVarInt(-234567));
+      inner.collect(BytesInput.fromZigZagVarLong(-890123456789L));
+      outer.collect(inner);
+
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      outer.writeAllTo(baos);
+      result = baos.toByteArray();
+    }
+
+    assertThat(new String(result, 0, 74))
+        .isEqualTo("This is a test text to validate the class ConcatenatingByteBufferCollector");
+    InputStream in = new ByteArrayInputStream(result, 74, result.length - 74);
+    assertThat(BytesUtils.readIntLittleEndian(in)).isEqualTo(12345);
+    assertThat(BytesUtils.readUnsignedVarInt(in)).isEqualTo(67891);
+    assertThat(BytesUtils.readUnsignedVarLong(in)).isEqualTo(2345678901L);
+    assertThat(BytesUtils.readZigZagVarInt(in)).isEqualTo(-234567);
+    assertThat(BytesUtils.readZigZagVarLong(in)).isEqualTo(-890123456789L);
+  }
+
+  private static byte[] bytes(String str) {
+    return str.getBytes(StandardCharsets.UTF_8);
+  }
+
+  private static ByteBuffer byteBuffer(String str) {
+    return ByteBuffer.wrap(bytes(str));
+  }
+
+  private static InputStream inputStream(String str) {
+    return new ByteArrayInputStream(bytes(str));
+  }
+
+  private static ByteArrayOutputStream byteArrayOutputStream(String str) throws IOException {
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    baos.write(bytes(str));
+    return baos;
+  }
+
+  private static CapacityByteArrayOutputStream capacityByteArrayOutputStream(String str) {
+    CapacityByteArrayOutputStream cbaos =
+        new CapacityByteArrayOutputStream(2, Integer.MAX_VALUE, new HeapByteBufferAllocator());
+    for (byte b : bytes(str)) {
+      cbaos.write(b);
+    }
+    return cbaos;
+  }
+
+  @Test
+  public void testWriteAllToReleasesProgressively() throws IOException {
+    byte[] result;
+    ConcatenatingByteBufferCollector collector = new ConcatenatingByteBufferCollector(allocator);
+    collector.collect(BytesInput.from(bytes("Hello")));
+    collector.collect(BytesInput.from(bytes(" ")));
+    collector.collect(BytesInput.from(bytes("World")));
+
+    assertThat(collector.size()).isEqualTo(11);
+
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    collector.writeAllTo(baos);
+    result = baos.toByteArray();
+
+    // After writeAllTo, the collector should be empty (buffers released progressively)
+    assertThat(collector.size()).isEqualTo(0);
+
+    // Verify the data was written correctly
+    assertThat(new String(result, StandardCharsets.UTF_8)).isEqualTo("Hello World");
+
+    // close() after writeAllTo is a safe no-op
+    collector.close();
+  }
+
+  @Test
+  public void testDoubleCloseIsSafe() throws IOException {
+    ConcatenatingByteBufferCollector collector = new ConcatenatingByteBufferCollector(allocator);
+    collector.collect(BytesInput.from(bytes("test data")));
+
+    assertThat(collector.size()).isEqualTo(9);
+
+    // First close releases the buffers
+    collector.close();
+    assertThat(collector.size()).isEqualTo(0);
+
+    // Second close should be a no-op and not throw
+    collector.close();
+  }
+
+  @Test
+  public void testCloseOnEmpty() {
+    // Close on an empty collector should not throw
+    ConcatenatingByteBufferCollector collector = new ConcatenatingByteBufferCollector(allocator);
+    collector.close();
+    collector.close(); // double close on empty
+  }
+
+  @Test
+  public void testWriteAllToProducesCorrectOutputWithMultipleTypes() throws IOException {
+    // Verify that writeAllTo produces correct output with mixed BytesInput types
+    byte[] result;
+
+    ConcatenatingByteBufferCollector collector = new ConcatenatingByteBufferCollector(allocator);
+    collector.collect(BytesInput.fromInt(42));
+    collector.collect(BytesInput.from(bytes("parquet")));
+    collector.collect(BytesInput.fromInt(99));
+
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    collector.writeAllTo(baos);
+    result = baos.toByteArray();
+
+    // Verify size: 4 (int) + 7 (string) + 4 (int) = 15 bytes
+    assertThat(result.length).isEqualTo(15);
+
+    // Already released by writeAllTo, close is a no-op
+    collector.close();
+  }
+}
